@@ -86,7 +86,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
-from utils import atomic_yaml_write, is_truthy_value
+from utils import atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
@@ -629,7 +629,6 @@ class GatewayRunner:
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
-        self._smart_model_routing = self._load_smart_model_routing()
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
@@ -787,6 +786,10 @@ class GatewayRunner:
 
     _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
 
+    def _voice_key(self, platform: Platform, chat_id: str) -> str:
+        """Return a platform-namespaced key for voice mode state."""
+        return f"{platform.value}:{chat_id}"
+
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
             data = json.loads(self._VOICE_MODE_PATH.read_text())
@@ -797,11 +800,21 @@ class GatewayRunner:
             return {}
 
         valid_modes = {"off", "voice_only", "all"}
-        return {
-            str(chat_id): mode
-            for chat_id, mode in data.items()
-            if mode in valid_modes
-        }
+        result = {}
+        for chat_id, mode in data.items():
+            if mode not in valid_modes:
+                continue
+            key = str(chat_id)
+            # Skip legacy unprefixed keys (warn and skip)
+            if ":" not in key:
+                logger.warning(
+                    "Skipping legacy unprefixed voice mode key %r during migration. "
+                    "Re-enable voice mode on that chat to rebuild the prefixed key.",
+                    key,
+                )
+                continue
+            result[key] = mode
+        return result
 
     def _save_voice_modes(self) -> None:
         try:
@@ -827,9 +840,14 @@ class GatewayRunner:
         disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
         if not isinstance(disabled_chats, set):
             return
+        platform = getattr(adapter, "platform", None)
+        if not isinstance(platform, Platform):
+            return
         disabled_chats.clear()
+        prefix = f"{platform.value}:"
         disabled_chats.update(
-            chat_id for chat_id, mode in self._voice_mode.items() if mode == "off"
+            key[len(prefix):] for key, mode in self._voice_mode.items()
+            if mode == "off" and key.startswith(prefix)
         )
 
     async def _safe_adapter_disconnect(self, adapter, platform) -> None:
@@ -1082,11 +1100,16 @@ class GatewayRunner:
         return model, runtime_kwargs
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
-        from agent.smart_model_routing import resolve_turn_route
+        """Build the effective model/runtime config for a single turn.
+
+        Always uses the session's primary model/provider.  If `/fast` is
+        enabled and the model supports Priority Processing / Anthropic fast
+        mode, attach `request_overrides` so the API call is marked
+        accordingly.
+        """
         from hermes_cli.models import resolve_fast_mode_overrides
 
-        primary = {
-            "model": model,
+        runtime = {
             "api_key": runtime_kwargs.get("api_key"),
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
@@ -1095,7 +1118,18 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
-        route = resolve_turn_route(user_message, getattr(self, "_smart_model_routing", {}), primary)
+        route = {
+            "model": model,
+            "runtime": runtime,
+            "signature": (
+                model,
+                runtime["provider"],
+                runtime["base_url"],
+                runtime["api_mode"],
+                runtime["command"],
+                tuple(runtime["args"]),
+            ),
+        }
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -1103,7 +1137,7 @@ class GatewayRunner:
             return route
 
         try:
-            overrides = resolve_fast_mode_overrides(route.get("model"))
+            overrides = resolve_fast_mode_overrides(route["model"])
         except Exception:
             overrides = None
         route["request_overrides"] = overrides
@@ -1461,20 +1495,6 @@ class GatewayRunner:
             pass
         return None
 
-    @staticmethod
-    def _load_smart_model_routing() -> dict:
-        """Load optional smart cheap-vs-strong model routing config."""
-        try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                return cfg.get("smart_model_routing", {}) or {}
-        except Exception:
-            pass
-        return {}
-
     def _snapshot_running_agents(self) -> Dict[str, Any]:
         return {
             session_key: agent
@@ -1647,12 +1667,32 @@ class GatewayRunner:
 
         notified: set = set()
         for session_key in active:
-            # Parse platform + chat_id from the session key.
-            _parsed = _parse_session_key(session_key)
-            if not _parsed:
-                continue
-            platform_str = _parsed["platform"]
-            chat_id = _parsed["chat_id"]
+            source = None
+            try:
+                if getattr(self, "session_store", None) is not None:
+                    self.session_store._ensure_loaded()
+                    entry = self.session_store._entries.get(session_key)
+                    source = getattr(entry, "origin", None) if entry else None
+            except Exception as e:
+                logger.debug(
+                    "Failed to load session origin for shutdown notification %s: %s",
+                    session_key,
+                    e,
+                )
+
+            if source is not None:
+                platform_str = source.platform.value
+                chat_id = source.chat_id
+                thread_id = source.thread_id
+            else:
+                # Fall back to parsing the session key when no persisted
+                # origin is available (legacy sessions/tests).
+                _parsed = _parse_session_key(session_key)
+                if not _parsed:
+                    continue
+                platform_str = _parsed["platform"]
+                chat_id = _parsed["chat_id"]
+                thread_id = _parsed.get("thread_id")
 
             # Deduplicate: one notification per chat, even if multiple
             # sessions (different users/threads) share the same chat.
@@ -1668,7 +1708,6 @@ class GatewayRunner:
 
                 # Include thread_id if present so the message lands in the
                 # correct forum topic / thread.
-                thread_id = _parsed.get("thread_id")
                 metadata = {"thread_id": thread_id} if thread_id else None
 
                 await adapter.send(chat_id, msg, metadata=metadata)
@@ -1921,6 +1960,39 @@ class GatewayRunner:
                 "or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id)."
             )
         
+        # Discover Python plugins before shell hooks so plugin block
+        # decisions take precedence in tie cases.  The CLI startup path
+        # does this via an explicit call in hermes_cli/main.py; the
+        # gateway lazily imports run_agent inside per-request handlers,
+        # so the discover_plugins() side-effect in model_tools.py is NOT
+        # guaranteed to have run by the time we reach this point.
+        try:
+            from hermes_cli.plugins import discover_plugins
+            discover_plugins()
+        except Exception:
+            logger.debug(
+                "plugin discovery failed at gateway startup", exc_info=True,
+            )
+
+        # Register declarative shell hooks from cli-config.yaml.  Gateway
+        # has no TTY, so consent has to come from one of the three opt-in
+        # channels (--accept-hooks on launch, HERMES_ACCEPT_HOOKS env var,
+        # or hooks_auto_accept: true in config.yaml).  We pass
+        # accept_hooks=False here and let register_from_config resolve
+        # the effective value from env + config itself — the CLI-side
+        # registration already honored --accept-hooks, and re-reading
+        # hooks_auto_accept here would just duplicate that lookup.
+        # Failures are logged but must never block gateway startup.
+        try:
+            from hermes_cli.config import load_config
+            from agent.shell_hooks import register_from_config
+            register_from_config(load_config(), accept_hooks=False)
+        except Exception:
+            logger.debug(
+                "shell-hook registration failed at gateway startup",
+                exc_info=True,
+            )
+
         # Discover and load event hooks
         self.hooks.discover_and_load()
         
@@ -2942,10 +3014,59 @@ class GatewayRunner:
         return bool(check_ids & allowed_ids)
 
     def _get_unauthorized_dm_behavior(self, platform: Optional[Platform]) -> str:
-        """Return how unauthorized DMs should be handled for a platform."""
+        """Return how unauthorized DMs should be handled for a platform.
+
+        Resolution order:
+        1. Explicit per-platform ``unauthorized_dm_behavior`` in config — always wins.
+        2. Explicit global ``unauthorized_dm_behavior`` in config — wins when no per-platform.
+        3. When an allowlist (``PLATFORM_ALLOWED_USERS`` or ``GATEWAY_ALLOWED_USERS``) is
+           configured, default to ``"ignore"`` — the allowlist signals that the owner has
+           deliberately restricted access; spamming unknown contacts with pairing codes
+           is both noisy and a potential info-leak. (#9337)
+        4. No allowlist and no explicit config → ``"pair"`` (open-gateway default).
+        """
         config = getattr(self, "config", None)
-        if config and hasattr(config, "get_unauthorized_dm_behavior"):
-            return config.get_unauthorized_dm_behavior(platform)
+
+        # Check for an explicit per-platform override first.
+        if config and hasattr(config, "get_unauthorized_dm_behavior") and platform:
+            platform_cfg = config.platforms.get(platform) if hasattr(config, "platforms") else None
+            if platform_cfg and "unauthorized_dm_behavior" in getattr(platform_cfg, "extra", {}):
+                # Operator explicitly configured behavior for this platform — respect it.
+                return config.get_unauthorized_dm_behavior(platform)
+
+        # Check for an explicit global config override.
+        if config and hasattr(config, "unauthorized_dm_behavior"):
+            if config.unauthorized_dm_behavior != "pair":  # non-default → explicit override
+                return config.unauthorized_dm_behavior
+
+        # No explicit override.  Fall back to allowlist-aware default:
+        # if any allowlist is configured for this platform, silently drop
+        # unauthorized messages instead of sending pairing codes.
+        if platform:
+            platform_env_map = {
+                Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
+                Platform.DISCORD:  "DISCORD_ALLOWED_USERS",
+                Platform.WHATSAPP: "WHATSAPP_ALLOWED_USERS",
+                Platform.SLACK:    "SLACK_ALLOWED_USERS",
+                Platform.SIGNAL:   "SIGNAL_ALLOWED_USERS",
+                Platform.EMAIL:    "EMAIL_ALLOWED_USERS",
+                Platform.SMS:      "SMS_ALLOWED_USERS",
+                Platform.MATTERMOST: "MATTERMOST_ALLOWED_USERS",
+                Platform.MATRIX:   "MATRIX_ALLOWED_USERS",
+                Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
+                Platform.FEISHU:   "FEISHU_ALLOWED_USERS",
+                Platform.WECOM:    "WECOM_ALLOWED_USERS",
+                Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOWED_USERS",
+                Platform.WEIXIN:   "WEIXIN_ALLOWED_USERS",
+                Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
+                Platform.QQBOT:    "QQ_ALLOWED_USERS",
+            }
+            if os.getenv(platform_env_map.get(platform, ""), "").strip():
+                return "ignore"
+
+        if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
+            return "ignore"
+
         return "pair"
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
@@ -3234,6 +3355,20 @@ class GatewayRunner:
             # parallel task and must never interrupt the active conversation.
             if _cmd_def_inner and _cmd_def_inner.name == "background":
                 return await self._handle_background_command(event)
+
+            # Session-level toggles that are safe to run mid-agent —
+            # /yolo can unblock a pending approval prompt, /verbose cycles
+            # the tool-progress display mode for the ongoing stream.
+            # Both modify session state without needing agent interaction
+            # and must not be queued (the safety net would discard them).
+            # /fast and /reasoning are config-only and take effect next
+            # message, so they fall through to the catch-all busy response
+            # below — users should wait and set them between turns.
+            if _cmd_def_inner and _cmd_def_inner.name in ("yolo", "verbose"):
+                if _cmd_def_inner.name == "yolo":
+                    return await self._handle_yolo_command(event)
+                if _cmd_def_inner.name == "verbose":
+                    return await self._handle_verbose_command(event)
 
             # Gateway-handled info/control commands with dedicated
             # running-agent handlers.
@@ -3774,9 +3909,11 @@ class GatewayRunner:
                 from agent.model_metadata import get_model_context_length
 
                 _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
+                _msg_runtime = _resolve_runtime_agent_kwargs()
                 _msg_ctx_len = get_model_context_length(
                     self._model,
-                    base_url=self._base_url or "",
+                    base_url=self._base_url or _msg_runtime.get("base_url") or "",
+                    api_key=_msg_runtime.get("api_key") or "",
                 )
                 _ctx_result = await preprocess_context_references_async(
                     message_text,
@@ -5524,7 +5661,7 @@ class GatewayRunner:
 
         # Cache notice
         cache_enabled = (
-            ("openrouter" in (result.base_url or "").lower() and "claude" in result.new_model.lower())
+            (base_url_host_matches(result.base_url or "", "openrouter.ai") and "claude" in result.new_model.lower())
             or result.api_mode == "anthropic_messages"
         )
         if cache_enabled:
@@ -5780,11 +5917,13 @@ class GatewayRunner:
         """Handle /voice [on|off|tts|channel|leave|status] command."""
         args = event.get_command_args().strip().lower()
         chat_id = event.source.chat_id
+        platform = event.source.platform
+        voice_key = self._voice_key(platform, chat_id)
 
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self.adapters.get(platform)
 
         if args in ("on", "enable"):
-            self._voice_mode[chat_id] = "voice_only"
+            self._voice_mode[voice_key] = "voice_only"
             self._save_voice_modes()
             if adapter:
                 self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
@@ -5794,13 +5933,13 @@ class GatewayRunner:
                 "Use /voice tts to get voice replies for all messages."
             )
         elif args in ("off", "disable"):
-            self._voice_mode[chat_id] = "off"
+            self._voice_mode[voice_key] = "off"
             self._save_voice_modes()
             if adapter:
                 self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
             return "Voice mode disabled. Text-only replies."
         elif args == "tts":
-            self._voice_mode[chat_id] = "all"
+            self._voice_mode[voice_key] = "all"
             self._save_voice_modes()
             if adapter:
                 self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
@@ -5813,7 +5952,7 @@ class GatewayRunner:
         elif args == "leave":
             return await self._handle_voice_channel_leave(event)
         elif args == "status":
-            mode = self._voice_mode.get(chat_id, "off")
+            mode = self._voice_mode.get(voice_key, "off")
             labels = {
                 "off": "Off (text only)",
                 "voice_only": "On (voice reply to voice messages)",
@@ -5837,15 +5976,15 @@ class GatewayRunner:
             return f"Voice mode: {labels.get(mode, mode)}"
         else:
             # Toggle: off → on, on/all → off
-            current = self._voice_mode.get(chat_id, "off")
+            current = self._voice_mode.get(voice_key, "off")
             if current == "off":
-                self._voice_mode[chat_id] = "voice_only"
+                self._voice_mode[voice_key] = "voice_only"
                 self._save_voice_modes()
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
                 return "Voice mode enabled."
             else:
-                self._voice_mode[chat_id] = "off"
+                self._voice_mode[voice_key] = "off"
                 self._save_voice_modes()
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
@@ -5891,7 +6030,7 @@ class GatewayRunner:
             adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
             if hasattr(adapter, "_voice_sources"):
                 adapter._voice_sources[guild_id] = event.source.to_dict()
-            self._voice_mode[event.source.chat_id] = "all"
+            self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=False)
             return (
@@ -5918,7 +6057,7 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
         # Always clean up state even if leave raised an exception
-        self._voice_mode[event.source.chat_id] = "off"
+        self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "off"
         self._save_voice_modes()
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
         if hasattr(adapter, "_voice_input_callback"):
@@ -5930,7 +6069,7 @@ class GatewayRunner:
 
         Cleans up runner-side voice_mode state that the adapter cannot reach.
         """
-        self._voice_mode[chat_id] = "off"
+        self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
         self._save_voice_modes()
         adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
@@ -6016,7 +6155,7 @@ class GatewayRunner:
             return False
 
         chat_id = event.source.chat_id
-        voice_mode = self._voice_mode.get(chat_id, "off")
+        voice_mode = self._voice_mode.get(self._voice_key(event.source.platform, chat_id), "off")
         is_voice_input = (event.message_type == MessageType.VOICE)
 
         should = (
@@ -10298,6 +10437,16 @@ class GatewayRunner:
                 elif pending_event:
                     pending = pending_event.text or _build_media_placeholder(pending_event)
                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
+
+            # Leftover /steer: if a steer arrived after the last tool batch
+            # (e.g. during the final API call), the agent couldn't inject it
+            # and returned it in result["pending_steer"]. Deliver it as the
+            # next user turn so it isn't silently dropped.
+            if result and not pending and not pending_event:
+                _leftover_steer = result.get("pending_steer")
+                if _leftover_steer:
+                    pending = _leftover_steer
+                    logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
