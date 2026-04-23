@@ -36,7 +36,7 @@ This skill assumes the current working directory is `job-hunt/` and uses the fix
 - `data/candidate_profile.json` -> canonical candidate profile
 - `data/master_experiences.json` -> detailed evidence inventory
 - `data/jobs/*.json` -> normalized job postings
-- `output/fit_reports/` -> fit analysis output location
+- `output/fit_reports/` -> fit analysis output location (note: singular 'output', not 'outputs')
 
 Do not move files or invent alternate directories.
 
@@ -137,6 +137,8 @@ Include special attention to:
 Inspect:
 - `data/candidate_profile.json`
 - `data/master_experiences.json` if available
+
+If `master_experiences.json` is missing, note that evidence strength may be reduced and confidence should be marked as Medium. The analysis can proceed using `candidate_profile.json` alone, but recommend creating the master experiences file for future deeper matching.
 
 Identify:
 - strongest skills

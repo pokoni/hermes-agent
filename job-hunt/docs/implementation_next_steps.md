@@ -21,7 +21,7 @@ Copy the prompt assets into:
 
 ### 3. Ensure output directory exists
 Create:
-- `job-hunt/output/fit_reports/`
+- `job-hunt/outputs/fit_reports/`
 
 ### 4. Register external skill directory in Hermes config
 If you want Hermes to discover repo-local skills directly, add your repo path to `skills.external_dirs`.
