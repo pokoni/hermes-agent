@@ -102,8 +102,8 @@ def map_to_schema(meta, sections, raw_content):
     # employment_type
     employment_type = meta.get('employment_type', 'unknown')
     # language_requirement
-    japanese_level = 'business'
-    english_level = 'none'
+    japanese_level = 'not_specified'
+    english_level = 'not_specified'
     notes = ''
     # check required skills for language mentions
     required = sections.get('Visible requirements', [])
@@ -113,6 +113,8 @@ def map_to_schema(meta, sections, raw_content):
                 japanese_level = 'JLPT N1'
             elif 'ビジネスレベル' in skill:
                 japanese_level = 'business'
+            else:
+                japanese_level = skill.strip()
         if '英語' in skill or 'English' in skill:
             english_level = 'business'
     # also check general eligibility section
@@ -120,10 +122,14 @@ def map_to_schema(meta, sections, raw_content):
         for line in sections['General internship eligibility visible on official internship page']:
             if '日本語または英語' in line:
                 notes = 'Japanese or English communication ability required'
-                english_level = 'business'
+                if english_level == 'not_specified':
+                    english_level = 'business'
+    # Build descriptive values instead of fabricating "none"
+    japanese_final = japanese_level if japanese_level != 'not_specified' else 'not_specified (check raw description for details)'
+    english_final = english_level if english_level != 'not_specified' else 'not_specified (source does not mention English requirement)'
     language_requirement = {
-        'japanese_level': japanese_level,
-        'english_level': english_level,
+        'japanese_level': japanese_final,
+        'english_level': english_final,
         'notes': notes if notes else None
     }
     # required_skills

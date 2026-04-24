@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "job-hunt/schemas/submission_review.schema.json",
+  "title": "SubmissionReviewDecision",
+  "type": "object",
+  "required": [
+    "job_id",
+    "company_name",
+    "job_title",
+    "ready_for_submission",
+    "requires_human_approval",
+    "blocking_issues",
+    "missing_items",
+    "recommended_next_action",
+    "review_timestamp"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "company_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "job_title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ready_for_submission": {
+      "type": "boolean"
+    },
+    "requires_human_approval": {
+      "type": "boolean",
+      "const": true
+    },
+    "blocking_issues": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "missing_items": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "recommended_next_action": {
+      "type": "string",
+      "enum": [
+        "revise_artifacts",
+        "verify_form_access",
+        "obtain_human_approval",
+        "prepare_submission_session"
+      ]
+    },
+    "review_timestamp": {
+      "type": "string",
+      "minLength": 1
+    },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "application_record.schema.json",
+  "title": "ApplicationRecord",
+  "type": "object",
+  "required": [
+    "application_id",
+    "job_basename",
+    "company_name",
+    "job_title",
+    "source",
+    "source_url",
+    "candidate_name",
+    "status",
+    "priority",
+    "created_at",
+    "updated_at",
+    "submission_date",
+    "last_contact_date",
+    "next_action_date",
+    "next_action",
+    "materials",
+    "fit_summary",
+    "notes"
+  ],
+  "properties": {
+    "application_id": { "type": "string", "minLength": 1 },
+    "job_basename": { "type": "string", "minLength": 1 },
+    "company_name": { "type": "string", "minLength": 1 },
+    "job_title": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "minLength": 1 },
+    "source_url": { "type": "string", "minLength": 1 },
+    "candidate_name": { "type": "string", "minLength": 1 },
+    "status": {
+      "type": "string",
+      "enum": [
+        "drafting",
+        "ready_to_submit",
+        "submitted",
+        "awaiting_reply",
+        "interview_scheduled",
+        "interview_completed",
+        "follow_up_needed",
+        "offer",
+        "rejected",
+        "withdrawn",
+        "archived"
+      ]
+    },
+    "priority": {
+      "type": "string",
+      "enum": ["high", "medium", "low"]
+    },
+    "created_at": { "type": ["string", "null"] },
+    "updated_at": { "type": ["string", "null"] },
+    "submission_date": { "type": ["string", "null"] },
+    "last_contact_date": { "type": ["string", "null"] },
+    "next_action_date": { "type": ["string", "null"] },
+    "next_action": { "type": ["string", "null"] },
+    "materials": {
+      "type": "object",
+      "required": [
+        "fit_report",
+        "tailor_plan",
+        "motivation_ja",
+        "self_pr_ja",
+        "application_mail_ja",
+        "resume_version",
+        "other"
+      ],
+      "properties": {
+        "fit_report": { "type": ["string", "null"] },
+        "tailor_plan": { "type": ["string", "null"] },
+        "motivation_ja": { "type": ["string", "null"] },
+        "self_pr_ja": { "type": ["string", "null"] },
+        "application_mail_ja": { "type": ["string", "null"] },
+        "resume_version": { "type": ["string", "null"] },
+        "other": {
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "fit_summary": {
+      "type": "object",
+      "required": [
+        "overall_fit",
+        "confidence",
+        "key_strengths",
+        "key_gaps",
+        "recommendation"
+      ],
+      "properties": {
+        "overall_fit": { "type": ["string", "null"] },
+        "confidence": { "type": ["string", "null"] },
+        "key_strengths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "key_gaps": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "recommendation": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": false
+}
